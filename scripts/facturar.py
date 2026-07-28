@@ -16,12 +16,12 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import cargar_config  # noqa: E402
 from soap_client import SoapError  # noqa: E402
+from tiempo import hoy_ar_afip  # noqa: E402
 from wsaa import obtener_credenciales  # noqa: E402
 import wsfe  # noqa: E402
 
@@ -107,7 +107,8 @@ def elegir_punto_venta(cliente, solicitado, configurado):
 def emitir(cliente, punto_venta, tipo_cbte, importe, concepto, doc_tipo, doc_nro,
            cond_iva_receptor, numero):
     """Solicita el CAE de un comprobante. NO reintenta ante error."""
-    fecha = datetime.now().strftime("%Y%m%d")
+    # Fecha argentina, no la del reloj del servidor: ARCA rechaza fechas futuras.
+    fecha = hoy_ar_afip()
     detalle = wsfe.detalle_factura_c(
         numero=numero, importe=importe, fecha=fecha, concepto=concepto,
         doc_tipo=doc_tipo, doc_nro=doc_nro, cond_iva_receptor=cond_iva_receptor,

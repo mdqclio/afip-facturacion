@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509 import load_pem_x509_certificate
 
 import soap_client
+from tiempo import ahora_ar
 
 NS_WSAA = "http://wsaa.view.sua.dvadac.desein.afip.gov"
 
@@ -29,12 +30,13 @@ MARGEN_VENCIMIENTO = datetime.timedelta(minutes=10)
 
 def crear_tra(service="wsfe", ttl_minutos=10):
     """Arma el XML del loginTicketRequest."""
-    ahora = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
+    ahora = ahora_ar()
     unique_id = str(int(time.time()))
     # generationTime con 10 minutos de tolerancia hacia atrás para absorber
-    # desfasajes de reloj contra el servidor de ARCA.
-    generation = (ahora - datetime.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S-03:00")
-    expiration = (ahora + datetime.timedelta(minutes=ttl_minutos)).strftime("%Y-%m-%dT%H:%M:%S-03:00")
+    # desfasajes de reloj contra el servidor de ARCA. El offset lo pone la propia
+    # zona horaria argentina, no un literal.
+    generation = (ahora - datetime.timedelta(minutes=10)).isoformat(timespec="seconds")
+    expiration = (ahora + datetime.timedelta(minutes=ttl_minutos)).isoformat(timespec="seconds")
 
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
