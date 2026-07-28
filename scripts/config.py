@@ -80,7 +80,9 @@ class Config:
         self.wsfe_url = AMBIENTES[self.ambiente]["wsfe"]
 
         self.cuit = int(str(datos.get("cuit", 0)).replace("-", "").strip() or 0)
-        self.punto_venta = int(datos.get("punto_venta", 1))
+        # Sin valor declarado queda en None: el punto de venta no se adivina.
+        _pto_vta = datos.get("punto_venta")
+        self.punto_venta = int(_pto_vta) if _pto_vta not in (None, "") else None
 
         self.cert_path = self._ruta(datos.get("cert_path") or datos.get("certificado"))
         self.key_path = self._ruta(datos.get("key_path") or datos.get("clave_privada"))

@@ -43,8 +43,17 @@ def _imprimir_pares(etiqueta, pares):
         print("  {}: {} - {}".format(etiqueta, codigo, mensaje))
 
 
+class PuntoVentaIndefinido(ValueError):
+    """No hay forma de determinar el punto de venta a usar."""
+
+
 def elegir_punto_venta(cliente, solicitado, configurado):
-    """Lista los puntos de venta y elige uno. Devuelve (pto_vta, lista, nota)."""
+    """Lista los puntos de venta y elige uno. Devuelve (pto_vta, lista, nota).
+
+    Si FEParamGetPtosVenta no devuelve nada (habitual en homologación) se usa el
+    punto de venta declarado en la configuración. Nunca se adivina un valor por
+    defecto: sin lista y sin config se levanta PuntoVentaIndefinido.
+    """
     lista, eventos = [], []
     nota = ""
     try:
@@ -78,9 +87,16 @@ def elegir_punto_venta(cliente, solicitado, configurado):
         elegido = nros[0]
         if configurado and int(configurado) not in nros:
             nota = "PtoVta {} de config no habilitado; se usa {}".format(configurado, elegido)
+    elif configurado:
+        # Sin lista (típico de homologación) manda el punto de venta del config.
+        elegido = int(configurado)
+        nota = (nota + "; " if nota else "") + \
+            "sin puntos de venta: se usa el PtoVta {} de la configuración".format(elegido)
     else:
-        elegido = 1
-        nota = (nota + "; " if nota else "") + "sin puntos de venta: se prueba con PtoVta=1"
+        raise PuntoVentaIndefinido(
+            "ARCA no devolvió puntos de venta y la configuración no declara "
+            "\"punto_venta\". Agregalo a {} o pasá --punto-venta N.".format(
+                cliente.cfg.ruta_config))
 
     print("\n  PtoVta elegido: {}".format(elegido))
     if nota:
@@ -218,6 +234,9 @@ def main():
     try:
         punto_venta, lista_pv, nota_pv = elegir_punto_venta(
             cliente, args.punto_venta, cfg.punto_venta)
+    except PuntoVentaIndefinido as e:
+        print("ERROR: {}".format(e))
+        return 2
     except SoapError as e:
         print("ERROR: {}".format(e))
         return 1
