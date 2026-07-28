@@ -2,12 +2,16 @@
 
 ## `DH_KEY_TOO_SMALL` o `SSL: DH_KEY_TOO_SMALL`
 
-AFIP usa claves Diffie-Hellman débiles. Ya está resuelto en `ssl_fix.py` (baja `SECLEVEL` a 1). Si aparece, verificá que `wsaa.py` y `facturar.py` estén importando `get_afip_session` de `ssl_fix`.
+Algunos servidores de ARCA negocian claves Diffie-Hellman débiles. Ya está resuelto en `ssl_fix.py` (baja `SECLEVEL` a 1 manteniendo la verificación del certificado y del hostname). Si aparece, verificá que `soap_client.py` esté importando `get_afip_session` de `ssl_fix`.
 
-## `Computador no autorizado a acceder al servicio`
+## `coe.notAuthorized` / `Computador no autorizado a acceder al servicio`
 
-- Certificado no asociado al servicio WSFE. Volvé al paso 5 del setup.
-- Estás usando el certificado de producción contra homologación o viceversa: son distintos.
+Es un fault del WSAA: la firma CMS llegó bien, pero ARCA no tiene una autorización que vincule ese certificado con el servicio pedido (`wsfe`) para ese CUIT.
+
+- **Homologación**: entrá a WSASS (https://wsass-homo.afip.gob.ar/wsass/portal/main.aspx) → "Autorizar Web Service Testing" (o "Crear Autorización a Servicio") → elegí el **alias/DN del certificado** que estás usando, el CUIT representado y el servicio **`wsfe` (Facturación Electrónica)**. Tener el certificado creado no alcanza: la autorización al servicio es un paso aparte.
+- **Producción**: "Administrador de Relaciones de Clave Fiscal" → Nueva Relación → servicio "Facturación Electrónica" → representante = el alias del certificado (paso 5 del setup).
+- Verificá también que no estés cruzando ambientes: el certificado de homologación no sirve contra producción ni al revés.
+- Para confirmar que el problema es la autorización y no la firma, firmá el mismo TRA con `openssl smime -sign ... -nodetach -outform DER`: si devuelve el mismo fault, el código está bien y falta la autorización en ARCA.
 
 ## `El CEE no se encuentra autorizado a emitir comprobantes`
 
@@ -15,13 +19,13 @@ Punto de venta no dado de alta como "Web Services" en AFIP. Paso 6 del setup.
 
 ## Token expirado / `expired TA`
 
-El token dura ~12 horas. Se cachea automáticamente en `$AFIP_HOME/certs/token_cache.json`. Para forzar renovación:
+El TA dura ~12 horas y se cachea en la ruta `ta_cache_path` del `config.json`. El código lo reutiliza hasta 10 minutos antes de su vencimiento y recién ahí pide uno nuevo.
 
-```bash
-rm $AFIP_HOME/certs/token_cache.json
-```
+**No borres el cache ni uses `--forzar-ta` de rutina**: ARCA penaliza pedir un TA nuevo mientras hay uno vigente (`El CEE ya posee un TA valido para el acceso al WSN solicitado`). Si ves ese error, esperá a que venza el TA vigente en vez de reintentar.
 
-O en Python: `obtener_credenciales(force=True)`.
+## `FEParamGetPtosVenta` no devuelve puntos de venta
+
+Normal en homologación: el ambiente de prueba no siempre replica los puntos de venta. El CLI informa el error de ARCA y cae a `PtoVta=1`, que en homologación suele estar habilitado. En producción significa que falta dar de alta el punto de venta tipo "Web Services" (paso 6 del setup).
 
 ## Factura rechazada con `10015 Fecha del comprobante invalida`
 

@@ -5,37 +5,47 @@ Esto se hace **una sola vez** por monotributista. Después, emitir facturas es u
 ## 0. Prerrequisitos
 
 - Python 3.8+
-- `pip install zeep cryptography lxml qrcode reportlab Pillow`
+- `pip install requests cryptography` (obligatorio) y `pip install qrcode reportlab Pillow` solo si querés el PDF
 - `openssl` (viene con macOS/Linux)
 - Clave fiscal AFIP nivel 3
 - Monotributo activo
 
-## 1. Elegir directorio de datos
+Empezá siempre por **homologación**: los comprobantes de prueba no tienen validez fiscal.
 
-Por defecto `~/afip/`. Para otro lugar, `export AFIP_HOME=/ruta/que/quieras`.
+## 1. Elegir directorio de datos (fuera del repositorio)
+
+Un directorio por ambiente, para no mezclar certificados:
 
 ```bash
-mkdir -p ~/afip/certs
-export AFIP_HOME=~/afip
+mkdir -p ~/arca-homo && chmod 700 ~/arca-homo
 ```
 
-## 2. Crear `emisor_config.json`
+Ahí van la clave privada, el certificado, `config.json`, el TA cacheado y el log. Nunca dentro del repo.
 
-En `$AFIP_HOME/emisor_config.json`:
+## 2. Crear `config.json`
+
+Copiá `config.example.json` a `~/arca-homo/config.json` y completalo:
 
 ```json
 {
+  "ambiente": "homologacion",
   "cuit": "20XXXXXXXXX",
   "punto_venta": 1,
-  "razon_social": "APELLIDO NOMBRE",
-  "condicion_iva": "Responsable Monotributo",
-  "domicilio": "Calle 123 - Ciudad",
-  "ingresos_brutos": "Exento",
-  "inicio_actividades": "DD/MM/YYYY"
+  "cert_path": "/home/usuario/arca-homo/mi_cert.crt",
+  "key_path": "/home/usuario/arca-homo/mi_clave.key",
+  "ta_cache_path": "/home/usuario/arca-homo/ta_homologacion.json",
+  "facturas_log_path": "/home/usuario/arca-homo/facturas_log.json",
+  "emisor": {
+    "razon_social": "APELLIDO NOMBRE",
+    "condicion_iva": "Responsable Monotributo",
+    "domicilio": "Calle 123 - Ciudad",
+    "ingresos_brutos": "Exento",
+    "inicio_actividades": "DD/MM/YYYY"
+  }
 }
 ```
 
-Datos fiscales: se sacan de la constancia de inscripción (https://seti.afip.gob.ar/padron-puc-constancia-internet/).
+`chmod 600 ~/arca-homo/config.json`. Si `ambiente` falta, se asume homologación. Datos fiscales: constancia de inscripción (https://seti.afip.gob.ar/padron-puc-constancia-internet/).
 
 ## 3. Generar clave privada + CSR
 
@@ -75,20 +85,21 @@ Si todavía no tenés un punto de venta tipo "Web Services":
 ## 7. Probar
 
 ```bash
-export AFIP_HOME=~/afip
 cd <ruta-del-skill>/scripts
-python3 wsaa.py   # debería imprimir un token
-python3 facturar.py --monto 1
+python3 wsaa.py --config ~/arca-homo/config.json          # debería imprimir token y sign
+python3 facturar.py --config ~/arca-homo/config.json --solo-consultas
+python3 facturar.py --config ~/arca-homo/config.json --importe 1000
 ```
 
-Si la factura se aprueba, se genera el PDF en el directorio actual y queda registrada en `$AFIP_HOME/facturas_log.json`.
+`--solo-consultas` corre FEDummy, FEParamGetPtosVenta y FECompUltimoAutorizado sin emitir nada: usalo siempre antes de la primera emisión.
 
 ## Homologación (testing)
 
-Para probar sin emitir facturas reales:
+Homologación usa un **certificado propio**, distinto del de producción, y son dos pasos separados:
 
-```bash
-export AFIP_ENV=homo
-```
+1. **Crear el certificado**: WSASS (https://wsass-homo.afip.gob.ar/wsass/portal/main.aspx) → "Crear Certificado" → subís el CSR y descargás el `.crt`.
+2. **Autorizar el certificado al servicio**: en el mismo WSASS → "Autorizar Web Service Testing" / "Crear Autorización a Servicio" → alias o DN del certificado + CUIT representado + servicio **`wsfe` (Facturación Electrónica)**.
 
-El entorno de homologación requiere un certificado separado (creado desde "Administración de Certificados Digitales" con alias en el ambiente de homologación, en https://wsass-homo.afip.gov.ar/wsass/portal/main.aspx).
+Sin el paso 2, WSAA responde `coe.notAuthorized — Computador no autorizado a acceder al servicio`, aunque el certificado sea válido y la firma CMS correcta.
+
+Los puntos de venta de homologación no coinciden necesariamente con los de producción: si `FEParamGetPtosVenta` no devuelve ninguno, probá con `PtoVta=1`.
