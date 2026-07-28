@@ -1,0 +1,17 @@
+{
+  "_comentario": "Copiar FUERA del repositorio (p.ej. ~/arca-homo/config.json) y completar. Nunca versionar este archivo ni el certificado, la clave privada o el TA cacheado.",
+  "ambiente": "homologacion",
+  "cuit": "20000000000",
+  "punto_venta": 1,
+  "cert_path": "/ruta/fuera/del/repo/certificado.crt",
+  "key_path": "/ruta/fuera/del/repo/clave_privada.key",
+  "ta_cache_path": "/ruta/fuera/del/repo/ta_homologacion.json",
+  "facturas_log_path": "/ruta/fuera/del/repo/facturas_log.json",
+  "emisor": {
+    "razon_social": "APELLIDO Nombre",
+    "condicion_iva": "Responsable Monotributo",
+    "domicilio": "Calle 123 - Ciudad",
+    "ingresos_brutos": "20-00000000-0",
+    "inicio_actividades": "01/01/2020"
+  }
+}

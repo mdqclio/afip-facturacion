@@ -4,8 +4,18 @@ certs/
 *.key
 *.crt
 *.csr
+*.pem
+*.p12
+*.pfx
+# Configuración real del emisor (CUIT, rutas): vive fuera del repo
+config.json
 emisor_config.json
-facturas_log.json
+!config.example.json
+# Tickets de acceso cacheados (son credenciales)
+ta_*.json
 token_cache.json
+# Salidas
+facturas_log*.json
 factura_*.pdf
+*.log
 .DS_Store

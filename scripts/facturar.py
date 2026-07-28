@@ -1,182 +1,306 @@
 #!/usr/bin/env python3
 """
-Facturación electrónica AFIP/ARCA — Factura C (monotributo) a Consumidor Final.
+Facturación electrónica ARCA/AFIP — Factura C (monotributo) a Consumidor Final.
+
+Flujo completo: FEDummy -> FEParamGetPtosVenta -> FECompUltimoAutorizado ->
+FECAESolicitar -> FECompConsultar.
 
 Uso:
-    export AFIP_HOME=~/afip
-    python3 facturar.py --monto 5000 --descripcion "Consultoría"
-    python3 facturar.py --monto 5000 --concepto 2 --desde 2026-04-01 --hasta 2026-04-30
+    python3 facturar.py --config /ruta/fuera/del/repo/config.json --importe 1000
+    python3 facturar.py --config config.json --importe 1000 --solo-consultas
+
+El ambiente por defecto es HOMOLOGACIÓN. Producción requiere declarar
+"ambiente": "produccion" en el archivo de configuración.
 """
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 
-import zeep
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import WSFE_URL, CUIT, PUNTO_VENTA, FACTURAS_LOG_PATH
-from wsaa import obtener_credenciales
-from generar_pdf import generar_pdf
+from config import cargar_config  # noqa: E402
+from soap_client import SoapError  # noqa: E402
+from wsaa import obtener_credenciales  # noqa: E402
+import wsfe  # noqa: E402
 
-TIPOS_CBTE = {"factura_c": 11, "nota_debito_c": 12, "nota_credito_c": 13}
-DOC_CONSUMIDOR_FINAL = 99
-
-
-def conectar_wsfe(token, sign):
-    from ssl_fix import get_afip_session
-    from zeep.transports import Transport
-    session = get_afip_session()
-    transport = Transport(session=session)
-    client = zeep.Client(wsdl=WSFE_URL, transport=transport)
-    auth = {"Token": token, "Sign": sign, "Cuit": CUIT}
-    return client, auth
+TIPOS_CBTE = {
+    "factura_c": wsfe.CBTE_FACTURA_C,
+    "nota_debito_c": wsfe.CBTE_NOTA_DEBITO_C,
+    "nota_credito_c": wsfe.CBTE_NOTA_CREDITO_C,
+}
 
 
-def ultimo_comprobante(client, auth, tipo_cbte=11, punto_venta=None):
-    pv = punto_venta or PUNTO_VENTA
-    response = client.service.FECompUltimoAutorizado(
-        Auth=auth, PtoVta=pv, CbteTipo=tipo_cbte,
+def _titulo(texto):
+    print("\n" + "=" * 62)
+    print(texto)
+    print("=" * 62)
+
+
+def _imprimir_pares(etiqueta, pares):
+    for codigo, mensaje in pares:
+        print("  {}: {} - {}".format(etiqueta, codigo, mensaje))
+
+
+def elegir_punto_venta(cliente, solicitado, configurado):
+    """Lista los puntos de venta y elige uno. Devuelve (pto_vta, lista, nota)."""
+    lista, eventos = [], []
+    nota = ""
+    try:
+        lista, eventos = cliente.puntos_venta()
+    except wsfe.WSFEError as e:
+        # En homologación es habitual que ARCA no devuelva puntos de venta.
+        print("  FEParamGetPtosVenta sin resultados:")
+        _imprimir_pares("Error", e.errores)
+        nota = "FEParamGetPtosVenta sin resultados"
+
+    if lista:
+        for pv in lista:
+            print("  PtoVta {:>5}  emision={:<12} bloqueado={:<3} baja={}".format(
+                pv.get("Nro", "?"), pv.get("EmisionTipo", ""),
+                pv.get("Bloqueado", ""), pv.get("FchBaja", "") or "-"))
+    else:
+        print("  (el ambiente no devolvió puntos de venta)")
+    _imprimir_pares("Evento", eventos)
+
+    nros = [int(pv["Nro"]) for pv in lista
+            if pv.get("Nro") and str(pv.get("Bloqueado", "N")).upper() != "S"]
+
+    if solicitado is not None:
+        elegido = int(solicitado)
+        if nros and elegido not in nros:
+            nota = "PtoVta {} forzado por CLI; no figura entre los habilitados {}".format(
+                elegido, nros)
+    elif configurado and nros and int(configurado) in nros:
+        elegido = int(configurado)
+    elif nros:
+        elegido = nros[0]
+        if configurado and int(configurado) not in nros:
+            nota = "PtoVta {} de config no habilitado; se usa {}".format(configurado, elegido)
+    else:
+        elegido = 1
+        nota = (nota + "; " if nota else "") + "sin puntos de venta: se prueba con PtoVta=1"
+
+    print("\n  PtoVta elegido: {}".format(elegido))
+    if nota:
+        print("  Nota: {}".format(nota))
+    return elegido, lista, nota
+
+
+def emitir(cliente, punto_venta, tipo_cbte, importe, concepto, doc_tipo, doc_nro,
+           cond_iva_receptor, numero):
+    """Solicita el CAE de un comprobante. NO reintenta ante error."""
+    fecha = datetime.now().strftime("%Y%m%d")
+    detalle = wsfe.detalle_factura_c(
+        numero=numero, importe=importe, fecha=fecha, concepto=concepto,
+        doc_tipo=doc_tipo, doc_nro=doc_nro, cond_iva_receptor=cond_iva_receptor,
     )
-    if response.Errors:
-        for err in response.Errors.Err:
-            print(f"Error: {err.Code} - {err.Msg}")
-        return None
-    return response.CbteNro
+    print("  Request FECAEDetRequest:")
+    print("    " + json.dumps(detalle, ensure_ascii=False))
 
+    respuesta = cliente.solicitar_cae(punto_venta, tipo_cbte, detalle)
 
-def crear_factura(client, auth, monto, concepto=1, fecha_desde=None, fecha_hasta=None,
-                  tipo_cbte=11, punto_venta=None):
-    pv = punto_venta or PUNTO_VENTA
-    last = ultimo_comprobante(client, auth, tipo_cbte, pv)
-    if last is None:
-        raise Exception("No se pudo obtener el último comprobante")
-    next_num = last + 1
-    today = datetime.now().strftime("%Y%m%d")
-
-    detalle = {
-        "Concepto": concepto,
-        "DocTipo": DOC_CONSUMIDOR_FINAL,
-        "DocNro": 0,
-        "CbteDesde": next_num,
-        "CbteHasta": next_num,
-        "CbteFch": today,
-        "ImpTotal": monto,
-        "ImpTotConc": 0,
-        "ImpNeto": monto,
-        "ImpOpEx": 0,
-        "ImpIVA": 0,
-        "ImpTrib": 0,
-        "MonId": "PES",
-        "MonCotiz": 1,
-    }
-
-    if concepto in (2, 3):
-        if not fecha_desde or not fecha_hasta:
-            raise ValueError("Para servicios debe indicar fecha_desde y fecha_hasta")
-        detalle["FchServDesde"] = fecha_desde.replace("-", "") if isinstance(fecha_desde, str) else fecha_desde.strftime("%Y%m%d")
-        detalle["FchServHasta"] = fecha_hasta.replace("-", "") if isinstance(fecha_hasta, str) else fecha_hasta.strftime("%Y%m%d")
-        detalle["FchVtoPago"] = today
-
-    request = {
-        "FeCabReq": {"CantReg": 1, "PtoVta": pv, "CbteTipo": tipo_cbte},
-        "FeDetReq": {"FECAEDetRequest": [detalle]},
-    }
-
-    response = client.service.FECAESolicitar(Auth=auth, FeCAEReq=request)
+    errores = wsfe.extraer_errores(respuesta)
+    eventos = wsfe.extraer_eventos(respuesta)
+    cabecera = (respuesta or {}).get("FeCabResp") or {}
+    det_resp = ((respuesta or {}).get("FeDetResp") or {}).get("FECAEDetResponse") or {}
+    if isinstance(det_resp, list):
+        det_resp = det_resp[0]
 
     resultado = {
-        "punto_venta": pv, "tipo_cbte": tipo_cbte, "numero": next_num,
-        "fecha": today, "monto": monto,
+        "punto_venta": punto_venta,
+        "tipo_cbte": tipo_cbte,
+        "numero": numero,
+        "fecha": fecha,
+        "importe": round(float(importe), 2),
+        "concepto": concepto,
+        "resultado_cabecera": cabecera.get("Resultado", ""),
+        "estado": det_resp.get("Resultado", "") or cabecera.get("Resultado", "") or "ERROR",
+        "cae": det_resp.get("CAE", ""),
+        "cae_vencimiento": det_resp.get("CAEFchVto", ""),
+        "errores": errores,
+        "eventos": eventos,
+        "observaciones": wsfe.extraer_observaciones(det_resp),
+        "detalle_enviado": detalle,
     }
 
-    if response.Errors:
-        for err in response.Errors.Err:
-            print(f"ERROR: {err.Code} - {err.Msg}")
-        resultado["estado"] = "ERROR"
-        return resultado
-
-    det = response.FeDetResp.FECAEDetResponse[0]
-    resultado["cae"] = det.CAE
-    resultado["cae_vencimiento"] = det.CAEFchVto
-    resultado["estado"] = det.Resultado
-
-    if det.Observaciones:
-        resultado["observaciones"] = [f"{o.Code}: {o.Msg}" for o in det.Observaciones.Obs]
+    if errores:
+        _imprimir_pares("Error", errores)
+    if resultado["observaciones"]:
+        _imprimir_pares("Observación", resultado["observaciones"])
+    if eventos:
+        _imprimir_pares("Evento", eventos)
 
     return resultado
 
 
+def guardar_log(cfg, resultado):
+    ruta = cfg.facturas_log_path
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            log = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        log = []
+    log.append(dict(resultado, ambiente=cfg.ambiente, cuit=cfg.cuit))
+    os.makedirs(os.path.dirname(ruta) or ".", exist_ok=True)
+    with open(ruta, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False, default=str)
+    return ruta
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Facturar electrónicamente por AFIP/ARCA")
-    parser.add_argument("--monto", type=float, default=1.0)
-    parser.add_argument("--concepto", type=int, default=1, choices=[1, 2, 3])
-    parser.add_argument("--desde", type=str)
-    parser.add_argument("--hasta", type=str)
-    parser.add_argument("--punto-venta", type=int)
-    parser.add_argument("--tipo", type=str, default="factura_c", choices=TIPOS_CBTE.keys())
-    parser.add_argument("--descripcion", type=str, default="Servicio profesional")
-    parser.add_argument("--condicion-venta", type=str, default="Contado")
+    parser = argparse.ArgumentParser(
+        description="Emitir Factura C por ARCA/AFIP (por defecto en HOMOLOGACIÓN)")
+    parser.add_argument("--config", help="ruta al config.json (fuera del repositorio)")
+    parser.add_argument("--importe", "--monto", type=float, default=1000.0,
+                        dest="importe", help="importe total del comprobante")
+    parser.add_argument("--concepto", type=int, default=3, choices=[1, 2, 3],
+                        help="1 productos, 2 servicios, 3 productos y servicios")
+    parser.add_argument("--tipo", default="factura_c", choices=sorted(TIPOS_CBTE))
+    parser.add_argument("--punto-venta", type=int, help="fuerza el punto de venta")
+    parser.add_argument("--doc-tipo", type=int, default=wsfe.DOC_CONSUMIDOR_FINAL)
+    parser.add_argument("--doc-nro", type=int, default=0)
+    parser.add_argument("--cond-iva-receptor", type=int,
+                        default=wsfe.COND_IVA_CONSUMIDOR_FINAL,
+                        help="condición IVA del receptor (5 = consumidor final)")
+    parser.add_argument("--solo-consultas", action="store_true",
+                        help="corre FEDummy/PtosVenta/UltimoAutorizado sin emitir")
+    parser.add_argument("--forzar-ta", action="store_true",
+                        help="pide un TA nuevo aunque haya uno vigente (ARCA lo penaliza)")
+    parser.add_argument("--pdf", action="store_true",
+                        help="genera el PDF del comprobante (requiere reportlab y qrcode)")
+    parser.add_argument("--json", dest="salida_json",
+                        help="escribe el resultado completo en este archivo")
     args = parser.parse_args()
 
-    if CUIT == 0:
-        print("ERROR: emisor_config.json no configurado. Ver references/setup.md.")
-        return 1
+    try:
+        cfg = cargar_config(args.config)
+        cfg.validar()
+    except (FileNotFoundError, ValueError) as e:
+        print("ERROR de configuración: {}".format(e))
+        return 2
 
     tipo_cbte = TIPOS_CBTE[args.tipo]
 
-    print("=" * 50)
-    print("FACTURACIÓN ELECTRÓNICA AFIP/ARCA")
-    print("=" * 50)
+    _titulo("FACTURACIÓN ELECTRÓNICA ARCA/AFIP")
+    print(cfg.resumen())
+    if cfg.es_produccion:
+        print("\n*** AMBIENTE DE PRODUCCIÓN: los comprobantes son reales y fiscales ***")
 
-    token, sign = obtener_credenciales()
-    client, auth = conectar_wsfe(token, sign)
-
-    last = ultimo_comprobante(client, auth, tipo_cbte, args.punto_venta)
-    print(f"Último comprobante: {last}")
-    print(f"Próximo: {last + 1}  |  Monto: ${args.monto}  |  Concepto: {args.concepto}")
-    print("-" * 50)
-
-    resultado = crear_factura(
-        client, auth,
-        monto=args.monto, concepto=args.concepto,
-        fecha_desde=args.desde, fecha_hasta=args.hasta,
-        tipo_cbte=tipo_cbte, punto_venta=args.punto_venta,
-    )
-    resultado["descripcion"] = args.descripcion
-    resultado["concepto"] = args.concepto
-    resultado["condicion_venta"] = args.condicion_venta
-    if args.desde:
-        resultado["fecha_desde"] = args.desde.replace("-", "")
-    if args.hasta:
-        resultado["fecha_hasta"] = args.hasta.replace("-", "")
-
-    print()
-    if resultado["estado"] == "A":
-        print("FACTURA APROBADA!")
-        print(f"  Número: {resultado['punto_venta']:04d}-{resultado['numero']:08d}")
-        print(f"  CAE: {resultado['cae']}")
-        print(f"  Vencimiento CAE: {resultado['cae_vencimiento']}")
-        print(f"  Monto: ${resultado['monto']}  |  Fecha: {resultado['fecha']}")
-    else:
-        print("FACTURA RECHAZADA")
-        for obs in resultado.get("observaciones", []):
-            print(f"  Obs: {obs}")
-
-    if resultado["estado"] == "A":
-        pdf_path = generar_pdf(resultado)
-        print(f"  PDF: {pdf_path}")
-
+    # --- WSAA ---
+    _titulo("WSAA — Ticket de Acceso")
     try:
-        with open(FACTURAS_LOG_PATH, "r") as f:
-            log = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        log = []
-    log.append(resultado)
-    with open(FACTURAS_LOG_PATH, "w") as f:
-        json.dump(log, f, indent=2, default=str)
-    print(f"\nLog: {FACTURAS_LOG_PATH}")
+        token, sign = obtener_credenciales(cfg, "wsfe", forzar=args.forzar_ta)
+    except (SoapError, OSError) as e:
+        print("ERROR obteniendo el TA: {}".format(e))
+        return 1
 
-    return 0 if resultado["estado"] == "A" else 1
+    cliente = wsfe.WSFEClient(cfg, token, sign)
+
+    # --- a. FEDummy ---
+    _titulo("a. FEDummy — estado de los servidores")
+    try:
+        estado = cliente.dummy()
+    except SoapError as e:
+        print("ERROR: {}".format(e))
+        return 1
+    print("  AppServer : {}".format(estado.get("AppServer")))
+    print("  DbServer  : {}".format(estado.get("DbServer")))
+    print("  AuthServer: {}".format(estado.get("AuthServer")))
+    if not all(str(estado.get(k, "")).upper() == "OK"
+               for k in ("AppServer", "DbServer", "AuthServer")):
+        print("  ALGUN SERVIDOR NO ESTA OK — se aborta antes de emitir.")
+        return 1
+
+    # --- b. FEParamGetPtosVenta ---
+    _titulo("b. FEParamGetPtosVenta — puntos de venta")
+    try:
+        punto_venta, lista_pv, nota_pv = elegir_punto_venta(
+            cliente, args.punto_venta, cfg.punto_venta)
+    except SoapError as e:
+        print("ERROR: {}".format(e))
+        return 1
+
+    # --- c. FECompUltimoAutorizado ---
+    _titulo("c. FECompUltimoAutorizado — último comprobante")
+    try:
+        ultimo, eventos = cliente.ultimo_autorizado(punto_venta, tipo_cbte)
+    except wsfe.WSFEError as e:
+        _imprimir_pares("Error", e.errores)
+        return 1
+    except SoapError as e:
+        print("ERROR: {}".format(e))
+        return 1
+    _imprimir_pares("Evento", eventos)
+    proximo = ultimo + 1
+    print("  Último autorizado: {}   Próximo: {}".format(ultimo, proximo))
+
+    if args.solo_consultas:
+        print("\n--solo-consultas: no se emite ningún comprobante.")
+        return 0
+
+    # --- d. FECAESolicitar (sin reintentos) ---
+    _titulo("d. FECAESolicitar — Factura C {:04d}-{:08d}".format(punto_venta, proximo))
+    try:
+        resultado = emitir(
+            cliente, punto_venta, tipo_cbte, args.importe, args.concepto,
+            args.doc_tipo, args.doc_nro, args.cond_iva_receptor, proximo)
+    except SoapError as e:
+        # Puede haberse emitido igual: se consulta a mano, nunca se reintenta solo.
+        print("ERROR de transporte en FECAESolicitar: {}".format(e))
+        print("NO se reintenta automáticamente (riesgo de duplicado).")
+        print("Verificá con: python3 facturar.py --config ... --solo-consultas")
+        return 1
+
+    resultado["punto_venta_nota"] = nota_pv
+    resultado["puntos_venta"] = lista_pv
+    resultado["ta_cache_path"] = cfg.ta_cache_path
+
+    if resultado["estado"] != "A":
+        print("\nCOMPROBANTE RECHAZADO (Resultado={})".format(resultado["estado"] or "?"))
+        guardar_log(cfg, resultado)
+        if args.salida_json:
+            with open(args.salida_json, "w", encoding="utf-8") as f:
+                json.dump(resultado, f, indent=2, ensure_ascii=False, default=str)
+        return 1
+
+    print("\n  COMPROBANTE APROBADO")
+    print("  Número     : {:04d}-{:08d}".format(punto_venta, proximo))
+    print("  CAE        : {}".format(resultado["cae"]))
+    print("  Vto CAE    : {}".format(resultado["cae_vencimiento"]))
+    print("  Importe    : ${:.2f}".format(resultado["importe"]))
+
+    # --- e. FECompConsultar ---
+    _titulo("e. FECompConsultar — verificación del comprobante emitido")
+    try:
+        consulta, eventos = cliente.consultar_comprobante(punto_venta, tipo_cbte, proximo)
+        resultado["consulta"] = consulta
+        _imprimir_pares("Evento", eventos)
+        print(json.dumps(consulta, indent=2, ensure_ascii=False))
+        if consulta.get("CodAutorizacion") and consulta["CodAutorizacion"] != resultado["cae"]:
+            print("  ATENCIÓN: el CAE consultado no coincide con el emitido.")
+    except (wsfe.WSFEError, SoapError) as e:
+        print("No se pudo consultar el comprobante: {}".format(e))
+        resultado["consulta_error"] = str(e)
+
+    ruta_log = guardar_log(cfg, resultado)
+    print("\nLog de comprobantes: {}".format(ruta_log))
+    print("TA cacheado        : {}".format(cfg.ta_cache_path))
+
+    if args.salida_json:
+        with open(args.salida_json, "w", encoding="utf-8") as f:
+            json.dump(resultado, f, indent=2, ensure_ascii=False, default=str)
+        print("Resultado JSON     : {}".format(args.salida_json))
+
+    if args.pdf:
+        try:
+            from generar_pdf import generar_pdf
+            print("PDF                : {}".format(generar_pdf(resultado)))
+        except ImportError as e:
+            print("PDF omitido (faltan dependencias: {})".format(e))
+
+    return 0
 
 
 if __name__ == "__main__":
